@@ -1,4 +1,6 @@
-fastapi
-uvicorn[standard]
-playwright
-python-dotenv
+scrapling
+selectolax
+curl_cffi
+patchright
+msgspec
+browserforge
