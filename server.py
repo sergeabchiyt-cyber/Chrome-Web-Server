@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Chrome Web Server — FastAPI + Playwright
-Endpoints: /query  /fetch  /mcp
+Chrome Web Server — FastAPI + Playwright + Scrapling
+Endpoints: /health  /query  /fetch  /mcp
 """
 
 import asyncio
@@ -14,8 +14,10 @@ from typing import Any, Optional
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from playwright.async_api import Browser, async_playwright
+from scrapling.fetchers import StealthyFetcher
+from selectolax.parser import HTMLParser
 
 load_dotenv()
 
@@ -26,22 +28,46 @@ MCP_API_KEY = os.getenv("MCP_API_KEY")
 # ---------------------------------------------------------------------------
 
 _pw = None
-_browser: Browser = None
-_mcp_page = None          # persistent page for /mcp sessions
-_mcp_lock = asyncio.Lock()
+_browser: Browser = None          # shared browser for /query and /fetch
+_mcp_browser: Browser = None      # dedicated browser for /mcp
+_mcp_ctx = None                   # dedicated context for /mcp
+_mcp_page = None                  # current MCP page (recreated per navigate)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pw, _browser, _mcp_page
+    global _pw, _browser, _mcp_browser, _mcp_ctx, _mcp_page
     _pw = await async_playwright().start()
+
+    # Shared browser for /query and /fetch
     _browser = await _pw.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+        ],
+        ignore_default_args=["--enable-automation"],
     )
-    ctx = await _browser.new_context(user_agent=_UA)
-    _mcp_page = await ctx.new_page()
+
+    # Dedicated browser for /mcp — completely isolated
+    _mcp_browser = await _pw.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+        ],
+        ignore_default_args=["--enable-automation"],
+    )
+    _mcp_ctx = await _mcp_browser.new_context(user_agent=_UA)
+    _mcp_page = await _mcp_ctx.new_page()
+
     yield
+
+    await _mcp_browser.close()
     await _browser.close()
     await _pw.stop()
 
@@ -60,7 +86,7 @@ _UA = (
 # ---------------------------------------------------------------------------
 
 async def _ephemeral():
-    """New throwaway (ctx, page). Caller must await ctx.close()."""
+    """New throwaway (ctx, page) from shared browser. Caller must close ctx."""
     ctx = await _browser.new_context(user_agent=_UA)
     page = await ctx.new_page()
     return ctx, page
@@ -72,6 +98,30 @@ def _require_auth(authorization: Optional[str]):
     if authorization != f"Bearer {MCP_API_KEY}":
         raise HTTPException(401, "Unauthorized")
 
+
+def _parse_page(html: str) -> list:
+    """Parse Google search result HTML with selectolax."""
+    tree = HTMLParser(html)
+    results = []
+    for a in tree.css("a[href]"):
+        href = a.attributes.get("href", "")
+        if not href.startswith("http") or "google.com" in href:
+            continue
+        h3 = a.css_first("h3")
+        if not h3:
+            continue
+        title = h3.text(strip=True)
+        results.append({"url": href, "title": title, "description": ""})
+    return results
+
+
+_CLEAN_TEXT_JS = r"""
+() => {
+    ['script','style','nav','footer','noscript','iframe','aside']
+        .forEach(t => document.querySelectorAll(t).forEach(e => e.remove()));
+    return document.body?.innerText?.trim() || '';
+}
+"""
 
 _GOOGLE_JS = r"""
 () => {
@@ -96,35 +146,42 @@ _GOOGLE_JS = r"""
 }
 """
 
-_CLEAN_TEXT_JS = r"""
-() => {
-    ['script','style','nav','footer','noscript','iframe','aside']
-        .forEach(t => document.querySelectorAll(t).forEach(e => e.remove()));
-    return document.body?.innerText?.trim() || '';
-}
-"""
+
+# ---------------------------------------------------------------------------
+# /health
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
-# /query  — Google search → links + descriptions
+# /query  — Google search via StealthyFetcher (bypasses bot detection)
 # ---------------------------------------------------------------------------
 
 @app.get("/query")
 async def query_endpoint(q: str = Query(..., description="Search query string")):
     """
-    Search Google for `q`, return all result links with title + description.
+    Search Google for `q`. Uses StealthyFetcher (patchright stealth) to bypass
+    bot detection. Fetches 3 pages concurrently, deduplicates, returns up to 50.
     """
-    ctx, page = await _ephemeral()
-    try:
-        await page.goto(
-            f"https://www.google.com/search?q={q}&hl=en&num=20",
-            wait_until="domcontentloaded",
-            timeout=15_000,
+    pages = await asyncio.gather(*[
+        StealthyFetcher.async_fetch(
+            f"https://www.google.com/search?q={q}&hl=en&num=20&start={start}",
+            disable_resources=True,
+            headless=True,
         )
-        results = await page.evaluate(_GOOGLE_JS)
-        return JSONResponse(content=results)
-    finally:
-        await ctx.close()
+        for start in [0, 20, 40]
+    ])
+    seen = set()
+    results = []
+    for resp in pages:
+        for item in _parse_page(resp.html_content):
+            if item["url"] not in seen:
+                seen.add(item["url"])
+                results.append(item)
+    return JSONResponse(content=results[:50])
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +192,16 @@ async def query_endpoint(q: str = Query(..., description="Search query string"))
 async def fetch_endpoint(url: str = Query(..., description="URL to visit")):
     """
     Visit `url`, strip boilerplate, return clean text + title + final URL.
+    Falls back to 'commit' wait_until for slow/heavy pages.
     """
     if not url.startswith("http"):
         url = "https://" + url
     ctx, page = await _ephemeral()
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        except Exception:
+            await page.goto(url, wait_until="commit", timeout=30_000)
         content = await page.evaluate(_CLEAN_TEXT_JS)
         return JSONResponse(
             content={"url": page.url, "title": await page.title(), "content": content}
@@ -157,7 +218,7 @@ async def fetch_endpoint(url: str = Query(..., description="URL to visit")):
 MCP_TOOLS = [
     {
         "name": "navigate",
-        "description": "Navigate to a URL",
+        "description": "Navigate to a URL. Recreates the browser page fresh each call.",
         "inputSchema": {
             "type": "object",
             "properties": {"url": {"type": "string", "description": "Full URL"}},
@@ -271,10 +332,18 @@ MCP_TOOLS = [
 
 
 async def _execute_tool(name: str, args: dict) -> Any:
+    global _mcp_page
     p = _mcp_page
 
     if name == "navigate":
-        await p.goto(args["url"], wait_until="domcontentloaded", timeout=20_000)
+        # Recreate page fresh on every navigate to avoid stuck/frozen state
+        try:
+            await _mcp_page.close()
+        except Exception:
+            pass
+        _mcp_page = await _mcp_ctx.new_page()
+        p = _mcp_page
+        await p.goto(args["url"], wait_until="domcontentloaded", timeout=30_000)
         return {"url": p.url, "title": await p.title()}
 
     elif name == "get_content":
@@ -366,7 +435,6 @@ async def mcp_endpoint(
     def _err(code, msg):
         return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": msg}}
 
-    # ---- dispatch ----
     if method == "initialize":
         payload = _ok(
             {
@@ -377,7 +445,6 @@ async def mcp_endpoint(
         )
 
     elif method in ("notifications/initialized", "ping"):
-        # fire-and-forget or no-op
         payload = None
 
     elif method == "tools/list":
@@ -386,33 +453,33 @@ async def mcp_endpoint(
     elif method == "tools/call":
         tool_name = params.get("name")
         tool_args = params.get("arguments", {})
-        async with _mcp_lock:
-            try:
-                result = await _execute_tool(tool_name, tool_args)
-                payload = _ok(
-                    {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
-                )
-            except Exception as exc:
-                payload = _ok(
-                    {
-                        "content": [{"type": "text", "text": f"Error: {exc}"}],
-                        "isError": True,
-                    }
-                )
+        try:
+            result = await _execute_tool(tool_name, tool_args)
+            payload = _ok(
+                {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
+            )
+        except Exception as exc:
+            payload = _ok(
+                {
+                    "content": [{"type": "text", "text": f"Error: {exc}"}],
+                    "isError": True,
+                }
+            )
 
     else:
         payload = _err(-32601, f"Method not found: {method}")
 
     if payload is None:
-        return JSONResponse(content={}, status_code=204)
+        return Response(status_code=204)
 
-    # Honour SSE Accept header (some MCP clients request it)
+    body_bytes = json.dumps(payload, ensure_ascii=False).encode()
+
     if "text/event-stream" in request.headers.get("accept", ""):
         async def _sse():
             yield f"data: {json.dumps(payload)}\n\n"
         return StreamingResponse(_sse(), media_type="text/event-stream")
 
-    return JSONResponse(content=payload)
+    return Response(content=body_bytes, media_type="application/json")
 
 
 # ---------------------------------------------------------------------------
