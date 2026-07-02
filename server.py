@@ -21,8 +21,6 @@ from selectolax.parser import HTMLParser
 
 load_dotenv()
 
-MCP_API_KEY = os.getenv("MCP_API_KEY")
-
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -90,13 +88,6 @@ async def _ephemeral():
     ctx = await _browser.new_context(user_agent=_UA)
     page = await ctx.new_page()
     return ctx, page
-
-
-def _require_auth(authorization: Optional[str]):
-    if not MCP_API_KEY:
-        raise HTTPException(500, "MCP_API_KEY env var not set")
-    if authorization != f"Bearer {MCP_API_KEY}":
-        raise HTTPException(401, "Unauthorized")
 
 
 def _parse_page(html: str) -> list:
@@ -212,7 +203,6 @@ async def fetch_endpoint(url: str = Query(..., description="URL to visit")):
 
 # ---------------------------------------------------------------------------
 # /mcp  — MCP (Model Context Protocol) over Streamable HTTP
-# Requires:  Authorization: Bearer <MCP_API_KEY>
 # ---------------------------------------------------------------------------
 
 MCP_TOOLS = [
@@ -414,16 +404,10 @@ async def _execute_tool(name: str, args: dict) -> Any:
 
 
 @app.post("/mcp")
-async def mcp_endpoint(
-    request: Request,
-    authorization: Optional[str] = Header(None),
-):
+async def mcp_endpoint(request: Request):
     """
     MCP Streamable HTTP transport (JSON-RPC 2.0).
-    All calls require:  Authorization: Bearer <MCP_API_KEY>
     """
-    _require_auth(authorization)
-
     body = await request.json()
     method = body.get("method", "")
     params = body.get("params", {})
@@ -488,6 +472,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
+        port=int(os.getenv("PORT", 7860)),
         reload=False,
     )
