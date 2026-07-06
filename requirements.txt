@@ -4,3 +4,7 @@ curl_cffi
 patchright
 msgspec
 browserforge
+fastapi
+uvicorn
+python-dotenv
+playwright
